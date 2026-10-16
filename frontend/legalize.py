@@ -29,6 +29,9 @@ def _fold_batchnorm(graph):
           y = Conv(x, W, b)
           => new_W = W * (gamma/sqrt(var+eps))     [broadcast over out-channel dim]
           => new_b = (b - mean) * (gamma/sqrt(var+eps)) + beta
+
+    A BN that can't be folded is NOT an error here — it is simply left alone, and
+    Phase B lowers it to an exact Mul + Add instead (see _convert_batchnorm).
     """
     changed = True
     while changed:
@@ -36,6 +39,8 @@ def _fold_batchnorm(graph):
         for node in list(graph.nodes):
             if node.op_type != "BatchNormalization":
                 continue
+            if node.attrs.get("training_mode", 0) or len(node.outputs) != 1 or len(node.inputs) < 5:
+                continue  # training-mode BN: not foldable (Phase B gives the clear error)
 
             x = node.inputs[0]
             producer = x.producer
@@ -43,37 +48,33 @@ def _fold_batchnorm(graph):
                 continue  # not directly preceded by a Conv — can't fold
             if len(x.consumers) != 1:
                 continue  # Conv's output is used elsewhere too — folding would silently break that other use
+            if x in graph.outputs:
+                continue  # Conv's un-normalized output is ALSO a graph output the caller can observe
 
             conv = producer
-            W_name = conv.inputs[1].name
-            W = graph.initializers.get(W_name)
+            W = graph.initializers.get(conv.inputs[1].name)
             if W is None:
                 continue  # weight isn't a compile-time constant — can't fold
+            params = [graph.initializers.get(t.name) for t in node.inputs[1:5]]
+            if any(p is None for p in params):
+                continue  # BN parameters aren't constants — can't fold
+            gamma, beta, mean, var = params
 
-            has_bias = len(conv.inputs) > 2
+            has_bias = len(conv.inputs) > 2 and conv.inputs[2] is not None
             b = graph.initializers.get(conv.inputs[2].name) if has_bias else np.zeros(W.shape[0], dtype=W.dtype)
-
-            gamma = graph.initializers[node.inputs[1].name]
-            beta = graph.initializers[node.inputs[2].name]
-            mean = graph.initializers[node.inputs[3].name]
-            var = graph.initializers[node.inputs[4].name]
+            if b is None:
+                continue
             eps = node.attrs.get("epsilon", 1e-5)
 
             factor = gamma / np.sqrt(var + eps)
-            new_W = W * factor.reshape(-1, 1, 1, 1)
-            new_b = (b - mean) * factor + beta
+            new_W = (W * factor.reshape(-1, 1, 1, 1)).astype(W.dtype)
+            new_b = ((b - mean) * factor + beta).astype(W.dtype)
 
-            _update_constant_value(graph, W_name, new_W)
-
+            _set_private_constant(graph, conv, 1, new_W, "weight")
             if has_bias:
-                _update_constant_value(graph, conv.inputs[2].name, new_b)
+                _set_private_constant(graph, conv, 2, new_b, "bias")
             else:
-                b_tensor = Tensor(conv.name + "_bias_folded", shape=tuple(new_b.shape), dtype=str(new_b.dtype))
-                graph.initializers[b_tensor.name] = new_b
-                b_const = IRNode("Constant", conv.name + "_bias_folded_const", [], [b_tensor], attrs={"value": new_b})
-                graph.nodes.insert(graph.nodes.index(conv), b_const)
-                conv.inputs.append(b_tensor)
-                b_tensor.consumers.append(conv)
+                _append_constant_input(graph, conv, conv.name + "_bias_folded", new_b)
 
             # Rewire: Conv's real output becomes whatever BN used to output.
             bn_out = node.outputs[0]
@@ -85,8 +86,7 @@ def _fold_batchnorm(graph):
             # IMPORTANT: detach BEFORE removing, or gamma/beta/mean/var keep a
             # stale reference to this node in their .consumers lists — which
             # would silently hide them from the orphan check in verify().
-            _detach(node)
-            graph.remove_node(node)
+            graph.remove_node(node)         # remove_node() detaches first
             changed = True
             break  # graph.nodes mutated — restart the scan
 
@@ -97,6 +97,40 @@ def _update_constant_value(graph, tensor_name, new_value):
         if n.op_type == "Constant" and n.outputs and n.outputs[0].name == tensor_name:
             n.attrs["value"] = new_value
             return
+
+
+def _new_constant(graph, name, value):
+    """Create a constant tensor + its Constant node (registered everywhere it needs to be)."""
+    t = Tensor(name, shape=tuple(value.shape), dtype=str(value.dtype))
+    graph.initializers[name] = value
+    graph.tensors[name] = t
+    return t, IRNode("Constant", name + "_const", [], [t], attrs={"value": value})
+
+
+def _set_private_constant(graph, consumer, idx, new_value, tag):
+    """
+    Make input #idx of `consumer` hold `new_value` WITHOUT changing what any other node sees.
+      * `consumer` is the tensor's only reader  -> overwrite it in place (cheap, no clutter)
+      * the tensor is shared (weight tying, one bias used twice) -> give `consumer` its own
+        fresh copy and leave the shared original untouched.
+    """
+    old = consumer.inputs[idx]
+    if len(old.consumers) == 1:
+        _update_constant_value(graph, old.name, new_value)
+        return
+    new_t, const_node = _new_constant(graph, f"{consumer.name}_{tag}_folded", new_value)
+    graph.nodes.insert(graph.nodes.index(consumer), const_node)
+    old.consumers.remove(consumer)
+    consumer.inputs[idx] = new_t
+    new_t.consumers.append(consumer)
+
+
+def _append_constant_input(graph, consumer, name, value):
+    """Add a brand-new constant as the next input of `consumer` (e.g. a bias the Conv never had)."""
+    t, const_node = _new_constant(graph, name, value)
+    graph.nodes.insert(graph.nodes.index(consumer), const_node)
+    consumer.inputs.append(t)
+    t.consumers.append(consumer)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +189,102 @@ def _convert_gemm(node, graph):
     return new_nodes
 
 
+# --- BatchNorm that could not fold into a Conv  ->  Mul + Add  (exact) ------------------
+
+_CONV_LIKE = {"Conv", "Conv2D", "MaxPool", "AveragePool", "GlobalAveragePool"}
+_RANK_PRESERVING = {"Relu", "ReLU", "Clip", "Identity", "BatchNormalization", "Transpose",
+                    "QuantizeLinear", "DequantizeLinear", "Requantize", "Quant", "BipolarQuant",
+                    "Concat", "Slice", "Split"}
+_BROADCASTING = {"Add", "Mul", "Max", "Min"}
+
+
+def _static_rank(t, graph):
+    """
+    Rank (number of dims) of tensor `t` at legalize time, or None if it can't be told.
+    Shapes of intermediate tensors don't exist yet (shape inference runs LATER), but the
+    rank is usually obvious from whoever produced the tensor.
+    """
+    if t.shape is not None:
+        return len(t.shape)
+    p = t.producer
+    if p is None:
+        return None
+    op = p.op_type
+    if op in _CONV_LIKE:
+        return 4
+    if op in ("Flatten", "Gemm"):
+        return 2
+    if op == "Reshape":
+        if "flatten_axis" in p.attrs:
+            return 2
+        target = graph.initializers.get(p.inputs[1].name) if len(p.inputs) > 1 else None
+        return len(target) if target is not None else None
+    if op in _BROADCASTING or op == "MatMul":
+        ranks = [_static_rank(i, graph) for i in p.inputs if i is not None]
+        return None if (not ranks or None in ranks) else max(ranks)
+    if op in _RANK_PRESERVING and p.inputs and p.inputs[0] is not None:
+        return _static_rank(p.inputs[0], graph)
+    return None
+
+
+def _convert_batchnorm(node, graph):
+    """
+    Inference-mode BatchNorm is just a per-channel affine map:
+        y = (x - mean) / sqrt(var + eps) * gamma + beta  =  x * scale + shift
+        scale = gamma / sqrt(var + eps),   shift = beta - mean * scale
+    scale/shift are constants, so this is an exact Mul followed by an Add — both core ops.
+    The constants are reshaped to [C, 1, 1, ...] so they broadcast along the channel axis (dim 1).
+    """
+    if node.attrs.get("training_mode", 0) or len(node.outputs) != 1:
+        raise ValueError(f"BatchNormalization '{node.name}': training-mode BatchNorm isn't supported "
+                         f"— export the model in eval mode.")
+    params = [graph.initializers.get(t.name) for t in node.inputs[1:5]]
+    if len(node.inputs) < 5 or any(p is None for p in params):
+        raise ValueError(f"BatchNormalization '{node.name}': gamma/beta/mean/var must be compile-time "
+                         f"constants so they can be baked into a Mul + Add.")
+    gamma, beta, mean, var = params
+    x = node.inputs[0]
+    rank = _static_rank(x, graph)
+    if rank is None or rank < 2:
+        raise ValueError(f"BatchNormalization '{node.name}': can't work out the rank of its input "
+                         f"'{x.name}' at legalize time, so the per-channel constants can't be shaped.")
+    eps = node.attrs.get("epsilon", 1e-5)
+    scale = gamma / np.sqrt(var + eps)
+    shift = beta - mean * scale
+    bshape = (-1,) + (1,) * (rank - 2)                     # channel axis is dim 1
+    scale = scale.reshape(bshape).astype(gamma.dtype)
+    shift = shift.reshape(bshape).astype(gamma.dtype)
+
+    s_t, s_node = _new_constant(graph, node.name + "_bn_scale", scale)
+    b_t, b_node = _new_constant(graph, node.name + "_bn_shift", shift)
+    scaled = Tensor(node.name + "_bn_scaled")
+    return [s_node, b_node,
+            IRNode("Mul", node.name + "_bn_mul", [x, s_t], [scaled]),
+            IRNode("Add", node.name + "_bn_add", [scaled, b_t], node.outputs)]
+
+
+# --- Split: normalise "where do the sizes live" across opset versions ------------------
+
+def _convert_split_v1(node, graph):
+    """Opset < 13: piece sizes are an ATTRIBUTE `split` (optional -> equal pieces)."""
+    sizes = [int(v) for v in node.attrs["split"]] if "split" in node.attrs else None
+    return [IRNode("Split", node.name, node.inputs[:1], node.outputs,
+                   attrs={"axis": node.attrs.get("axis", 0), "split": sizes})]
+
+
+def _convert_split_v13(node, graph):
+    """Opset >= 13: piece sizes are an optional constant INPUT. (opset 18 adds num_outputs,
+    which is implied by the number of outputs, so nothing extra is needed.)"""
+    sizes = None
+    if len(node.inputs) > 1 and node.inputs[1] is not None:
+        arr = graph.initializers.get(node.inputs[1].name)
+        if arr is None:
+            raise ValueError(f"Split node '{node.name}': piece sizes aren't a compile-time constant.")
+        sizes = [int(v) for v in arr]
+    return [IRNode("Split", node.name, node.inputs[:1], node.outputs,
+                   attrs={"axis": node.attrs.get("axis", 0), "split": sizes})]
+
+
 def _convert_qonnx_quant(node, graph):
     x = node.inputs[0]
     scale_t = node.inputs[1] if len(node.inputs) > 1 else None
@@ -199,23 +329,26 @@ def _convert_clip_v1(node, graph):
     return [IRNode("Clip", node.name, node.inputs[:1], node.outputs, attrs={"min": min_val, "max": max_val})]
 
 
+def _opt_const_scalar(node, graph, idx, default, what):
+    """Optional constant input #idx as a float: `default` if omitted (None placeholder or absent)."""
+    t = node.inputs[idx] if len(node.inputs) > idx else None
+    if t is None:
+        return default
+    if t.name not in graph.initializers:
+        raise ValueError(f"{node.op_type} node '{node.name}': {what} bound isn't a compile-time constant — not supported.")
+    return float(graph.initializers[t.name])
+
+
 def _convert_clip_v11(node, graph):
     """
     Opset >= 11: min/max are OPTIONAL TENSOR INPUTS (2nd, 3rd inputs) instead
     of attributes. They must be compile-time constants for us — resolve them
     from graph.initializers into the same normalized {"min", "max"} attrs.
+    Either may be omitted: Clip(x, "", max) arrives here as inputs [x, None, max].
     """
-    x = node.inputs[0]
-    min_val, max_val = float("-inf"), float("inf")
-    if len(node.inputs) > 1 and node.inputs[1].name in graph.initializers:
-        min_val = float(graph.initializers[node.inputs[1].name])
-    elif len(node.inputs) > 1:
-        raise ValueError(f"Clip node '{node.name}': min bound isn't a compile-time constant — not supported.")
-    if len(node.inputs) > 2 and node.inputs[2].name in graph.initializers:
-        max_val = float(graph.initializers[node.inputs[2].name])
-    elif len(node.inputs) > 2:
-        raise ValueError(f"Clip node '{node.name}': max bound isn't a compile-time constant — not supported.")
-    return [IRNode("Clip", node.name, [x], node.outputs, attrs={"min": min_val, "max": max_val})]
+    min_val = _opt_const_scalar(node, graph, 1, float("-inf"), "min")
+    max_val = _opt_const_scalar(node, graph, 2, float("inf"), "max")
+    return [IRNode("Clip", node.name, node.inputs[:1], node.outputs, attrs={"min": min_val, "max": max_val})]
 
 
 # Ops whose legalization genuinely differs by opset version, à la TVM's
@@ -223,6 +356,7 @@ def _convert_clip_v11(node, graph):
 # At lookup time we pick the highest registered version <= the model's opset.
 VERSIONED_CONVERT_MAP = {
     "Clip": {1: _convert_clip_v1, 11: _convert_clip_v11},
+    "Split": {1: _convert_split_v1, 13: _convert_split_v13},
 }
 
 
@@ -247,10 +381,10 @@ CONVERT_MAP = {
     "DequantizeLinear": _rename("DequantizeLinear"),
     "Flatten": _convert_flatten,
     "Gemm": _convert_gemm,
-    # NOTE: "BatchNormalization" is intentionally absent — it must be
-    # removed by _fold_batchnorm before this table is ever consulted. If one
-    # somehow survives (no foldable preceding Conv), it correctly falls
-    # through to rejection below — we have no runtime BN op in our ISA.
+    # BatchNormalization: _fold_batchnorm (Phase A) removes every BN that sits right after a
+    # Conv. Any BN that survives to here (pre-activation ResNets, BN after Gemm, ...) is lowered
+    # to an exact Mul + Add — we have no runtime BN op in our ISA, but we don't need one.
+    "BatchNormalization": _convert_batchnorm,
 }
 
 # QONNX custom-domain ops -> converter function
@@ -289,12 +423,7 @@ def _lookup_converter(node, opset):
 
 
 def _detach(node):
-    for t in node.inputs:
-        if node in t.consumers:
-            t.consumers.remove(node)
-    for t in node.outputs:
-        if t.producer is node:
-            t.producer = None
+    node.detach()
 
 
 def legalize(graph):

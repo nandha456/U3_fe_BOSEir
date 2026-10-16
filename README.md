@@ -23,7 +23,21 @@ python main.py models/tiny_conv.onnx
 python main.py models/convbn.onnx
 python main.py models/residual_block.onnx
 python main.py models/unsupported_op.onnx   # this one is SUPPOSED to fail, on purpose
+
+python main.py models/residual_block.onnx --dump          # also print the resulting BoseIR
+python main.py my_model.onnx --dim N=1                     # pin a dynamic dimension named "N"
+python main.py my_model.onnx --input-shape x=1,3,224,224   # ...or a whole input shape
 ```
+
+## Test it
+
+```bash
+python -m pytest        # 60 tests, < 1 second
+```
+
+Every test builds a tiny model, runs it through **onnxruntime** and through our frontend
+(executed by `tests/ref_interp.py`), and asserts the values, shapes and dtypes agree.
+Full explanation, with a guide to every fix: **[docs/README.md](docs/README.md)**.
 
 ## Structure
 
@@ -38,7 +52,11 @@ frontend/
     verify.py           Stage 6  — final invariant checks before handoff
     pipeline.py          wires all six stages together, stage-by-stage logging
 
-main.py                            command-line entry point: `python main.py <file.onnx>`
+main.py                            command-line entry point: `python main.py <file.onnx> [--dim N=1] [--dump]`
+docs/                               explanations of the test harness and every fix (start at docs/README.md)
+tests/ref_interp.py                 numpy interpreter for BoseIR — executes the IR so we can compare with onnxruntime
+tests/oracle.py                     test helpers: build tiny models, run both ways, compare
+tests/test_*.py                     the pytest suite (run with `python -m pytest`)
 tests/make_tiny_model.py            one-node sanity test (single Conv)
 tests/make_convbn_model.py          tests BatchNorm folding specifically
 tests/make_residual_block_model.py  tests the full  residual pattern
@@ -76,19 +94,32 @@ models/                             generated test .onnx files live here
   so constants that get resolved into attributes (like Clip's min/max) are
   cleanly removed instead of left dangling.
 
+## Testing & correctness (added after probing the frontend against onnxruntime)
+
+The frontend is now checked by a differential test-suite (details: `docs/01-testing-harness.md`).
+That exercise found and fixed ~15 bugs, several of which **compiled without any error but
+produced a wrong result** (negative `Slice` indices, `auto_pad`, pool `ceil_mode` and default
+stride, `Clip` with a skipped input, BN-fold corrupting a shared weight, `QuantizeLinear`
+dtype). Every one now has a regression test — see `docs/02-fixes-explained.md`.
+
+Also new: ONNX `Constant` **nodes** are understood (PyTorch exports use them); dynamic dims
+must be pinned with `--dim` / `--input-shape` (otherwise a clear error says how); a
+BatchNorm that can't fold into a Conv is lowered to an exact `Mul` + `Add`; `Split` is
+implemented; `verify()` checks use-def consistency and rejects unresolved dims.
+
 ## What's genuinely NOT covered yet (be aware of these before you rely on it)
 
-- **QONNX `Quant`/`BipolarQuant` conversion is implemented but not tested
-  against a real Brevitas-exported model yet** — only the standard-ONNX
-  path (Conv/BN/ReLU/Add) has been tested end-to-end so far.
-- **Gemm decomposition** handles the common case (transA/transB, optional
-  bias) but explicitly rejects non-1.0 `alpha`/`beta` rather than silently
-  computing wrong values — check if your exported FC layer uses those.
-- **Slice** only handles the opset≥10 constant-input form, not the older
-  attribute-based form.
-- **MatMul shape inference** only handles the 2D×2D case (the common case
-  after Gemm decomposition) — will raise `NotImplementedError` on batched
-  matmul rather than compute it wrong.
+- **No real exported network has been run yet** — all tests use tiny hand-built models.
+  Running torchvision exports is the next step (`docs/04-whats-next.md`).
+- **QONNX `Quant`/`BipolarQuant`**: implemented but untested against a real Brevitas export,
+  and there is an **open design question** about what `Requantize` means (QONNX `Quant`
+  outputs *float* values; the frontend labels the output an integer type) —
+  see `docs/02-fixes-explained.md`.
+- **Gemm decomposition** rejects non-1.0 `alpha`/`beta` rather than computing wrong values.
+- **Slice** only handles the opset≥10 constant-input form, not the older attribute form.
+- **MatMul shape inference** only handles 2D×2D; batched matmul raises `NotImplementedError`.
+- Only `.onnx` input; no direct `.h5`/`.pth`/`.keras` importers.
+- Unsupported (rejected with a reason): Sigmoid, Softmax, Tanh, LSTM/GRU, If/Loop, NMS.
 
 ## Our 18 core ops (what the frontend must reduce every model down to)
 
